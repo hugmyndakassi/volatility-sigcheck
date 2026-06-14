@@ -52,8 +52,13 @@ class SigValidator:
     def __init__(self, catalog=None):
         self.catalog = catalog
 
-        _, self.file_signature = tempfile.mkstemp()
-        _, self.file_signed_data = tempfile.mkstemp()
+        fd_sig, self.file_signature = tempfile.mkstemp()
+        os.close(fd_sig)
+        fd_data, self.file_signed_data = tempfile.mkstemp()
+        os.close(fd_data)
+        # openssl smime -verify writes the verified content here; we don't need it
+        fd_out, self.file_output = tempfile.mkstemp()
+        os.close(fd_out)
 
     def __del__(self):
         self.clean_workin_dir()
@@ -92,6 +97,7 @@ class SigValidator:
 
         self.delete_file(self.file_signature)
         self.delete_file(self.file_signed_data)
+        self.delete_file(self.file_output)
 
     def delete_file(self, path):
         if os.path.exists(path):
@@ -132,10 +138,10 @@ class SigValidator:
             content = signature[offset+header_length:offset+header_length+length]
             self.save_data(self.file_signed_data, content)
 
-            # openssl smime -verify -inform DER -in /tmp/tmpt8qzo4d6 -binary -content /tmp/tmpjoakp92x -purpose any -CApath /etc/ssl/certs/ -out /tmp/dummy.txt
+            # openssl smime -verify -inform DER -in <sig> -binary -content <data> -purpose any -CApath /etc/ssl/certs/ -out <tmp>
             process = subprocess.Popen(['openssl', 'smime', '-verify', '-inform', 'DER', '-in', self.file_signature,
                                         '-binary', '-content', self.file_signed_data, '-purpose', 'any', '-CApath',
-                                        '/etc/ssl/certs/', '-out', '/tmp/dummy.txt'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                        '/etc/ssl/certs/', '-out', self.file_output], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             output = process.communicate()[1].decode("utf-8")
             result = output.split(':')[-1].replace('\n', '')
@@ -299,7 +305,7 @@ class SigValidator:
     def get_files_by_extension(self, path, extension):
         ret = []
 
-        if os.path.isdir(path):
+        if path and os.path.isdir(path):
             for root, _, files in os.walk(path):
                 for f in files:
                     _, ext = os.path.splitext(f)
