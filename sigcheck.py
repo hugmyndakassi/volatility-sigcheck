@@ -41,7 +41,7 @@ OPENSSL_REGEX = re.compile(r' *(?P<offset>[0-9]+):d=[0-9]+ +hl=(?P<header_length
 
 class ReturnCode(Enum):
     FILEOBJECT_ERROR = (1, 'Unable to read FileObject')
-    PE_REBUILT_FAILED = (2, 'Unable to rebuilt PE file')
+    PE_REBUILT_FAILED = (2, 'Unable to rebuild PE file')
     PE_CHECKSUM_MISMATCH = (3, 'PE OptionalHeader.CheckSum mismatch')
     PARTIAL_CONTENT_PE_DATA_ERROR = (4, 'Partial file content. Unable to load PE')
     SIGNED_FILE_NOT_VERIFIED = (5, 'Signed file, but not verified')
@@ -101,12 +101,15 @@ class SigCheck(AbstractWindowsCommand):
             profile = self._config.get_value("PROFILE")
             data = self.load_json(address_file)
 
-            for key in data.keys():
-                if profile == key:
-                    return data[key]
+            if profile in data:
+                return data[profile]
 
-            self.__debug_message('warning', '\'{0}\': Profile not found, trying to reconstruct ImageSectionObjects with \'{1}\''.format(profile, key))
-            return data[key]
+            if data:
+                fallback = sorted(data.keys())[0]
+                self.__debug_message('warning', '\'{0}\': Profile not found, trying to reconstruct ImageSectionObjects with \'{1}\''.format(profile, fallback))
+                return data[fallback]
+
+            self.__debug_message('error', 'No profiles available in \'{0}\''.format(address_file))
         except IOError:
             self.__debug_message('error', 'Unable to load most frequent addresses (\'{0}\' file) '.format(address_file))
 
@@ -145,7 +148,7 @@ class SigCheck(AbstractWindowsCommand):
             self.files = self.get_files()
 
             for module in modules:
-                module_path, module_name, pid = module
+                module_path, module_name, pid, task = module
                 if module_path in self.already_analyzed:
                     yield module_name, pid, self.already_analyzed[module_path]
                 else:
@@ -162,10 +165,10 @@ class SigCheck(AbstractWindowsCommand):
                             self.already_analyzed[module_path] = result
                             yield module_name, pid, result
                     # Sometimes, terminated processes are still listed
-                    elif task.ExitTime:
-                        yield task.ImageFileName, pid, ReturnCode.ALREADY_TERMINATED
+                    elif task is not None and task.ExitTime:
+                        yield module_name, pid, ReturnCode.ALREADY_TERMINATED
                     else:
-                        yield task.ImageFileName, pid, ReturnCode.NOT_PEB
+                        yield module_name, pid, ReturnCode.NOT_PEB
 
     def get_files(self):
         '''
@@ -201,11 +204,11 @@ class SigCheck(AbstractWindowsCommand):
 
         if dlls:
             for mod in task.get_load_modules():
-                ret += [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId))]
+                ret += [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId), task)]
         else:
             for mod in task.get_load_modules():
                 # Return first module (.exe in InLoadOrderModuleList)
-                return [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId))]
+                return [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId), task)]
 
         return ret
 
@@ -221,9 +224,9 @@ class SigCheck(AbstractWindowsCommand):
         for driver in drivers:
             owning_module = tasks.find_module(mods, mod_addrs, mods.values()[0].obj_vm.address_mask(driver.DriverStart))
             if owning_module:
-                ret += [(str(owning_module.FullDllName), str(owning_module.BaseDllName), '0')]
+                ret += [(str(owning_module.FullDllName), str(owning_module.BaseDllName), '0', None)]
             else:
-                ret += [('UNKNOWN', 'UNKNOWN', '0')]
+                ret += [('UNKNOWN', 'UNKNOWN', '0', None)]
 
         return ret
 
@@ -245,6 +248,8 @@ class SigCheck(AbstractWindowsCommand):
         if filename:
             # Use same notation
             filename = self.normalize_filepath(filename)
+            if not filename:
+                return False, None
             for f in self.files:
                 # We consider they are the same file if executable path and file object path match
                 if re.match(r'^{0}$'.format(filename), f['name'], flags=re.IGNORECASE):
@@ -261,17 +266,21 @@ class SigCheck(AbstractWindowsCommand):
         @return normalized filepath
         '''
 
-        to_replace = {
-                        '\\SystemRoot': '\\\\Device\\\\HarddiskVolume[0-9]\\\\Windows',
-                        '\\\\\\?\\C:': '\\\\Device\\\\HarddiskVolume[0-9]',
-                        'C:': '\\\\Device\\\\HarddiskVolume[0-9]'
-                    }
+        # Ordered from most to least specific: '\\?\C:' must be tried before 'C:',
+        # since 'C:' is a substring of it (dict ordering is not guaranteed in Py2.7)
+        to_replace = [
+                        ('\\SystemRoot', '\\\\Device\\\\HarddiskVolume[0-9]\\\\Windows'),
+                        ('\\\\\\?\\C:', '\\\\Device\\\\HarddiskVolume[0-9]'),
+                        ('C:', '\\\\Device\\\\HarddiskVolume[0-9]')
+                    ]
 
-        for key in to_replace.keys():
+        for key, replacement in to_replace:
             path = filepath.split(key)
 
             if len(path) == 2:
-                return to_replace[key] + re.escape(path[1])
+                return replacement + re.escape(path[1])
+
+        return None
 
     def extract_object(self, file_object):
         '''
@@ -476,11 +485,14 @@ class SigCheck(AbstractWindowsCommand):
             cert = self.sigv.extract_cert(pe)
             if cert:
                 algorithm, hash_file = self.sigv.get_digest_from_signature(cert)
-                digest = self.sigv.calculate_pe_digest(algorithm, content)
-                if hash_file == digest:
-                    return self.sigv.verify_signature(cert)
+                if algorithm:
+                    digest = self.sigv.calculate_pe_digest(algorithm, content)
+                    if hash_file == digest:
+                        return self.sigv.verify_signature(cert)
+                    else:
+                        return ReturnCode.AUTHENTICODE_SIGNATURE_MISMATCH
                 else:
-                    return ReturnCode.AUTHENTICODE_SIGNATURE_MISMATCH
+                    return ReturnCode.PARTIAL_CERTIFICATE
             # Or files can has a signature in a separate catalog file
             else:
                 # Calculate algorithm hash to later search in catalog files
@@ -571,7 +583,7 @@ class SigCheck(AbstractWindowsCommand):
                         return ReturnCode.CONTENT_SIGNED_NOT_VERIFIED
                 else:
                     # Microsoft programs in 'C:\Windows' are usually catalog-signed
-                    if re.match(r'\Device\HarddiskVolume[0-9]\Windows', file_object['name']):
+                    if re.match(r'\\Device\\HarddiskVolume[0-9]\\Windows', file_object['name']):
                         return ReturnCode.PARTIAL_CONTENT_MAYBE_CATALOG_SIGNED
 
                     return ReturnCode.PARTIAL_CONTENT_NOT_SIGNED

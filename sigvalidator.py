@@ -254,6 +254,8 @@ class SigValidator:
             certificate_table_addr = nt_headers + 0x98
         elif self.is_64bits(pe_data):
             certificate_table_addr = nt_headers + 0xa8
+        else:
+            raise pefile.PEFormatError('Unknown OptionalHeader magic (neither PE32 nor PE32+)')
 
         certificate_virtual_addr = self.unpack_dword(pe_data[certificate_table_addr:certificate_table_addr+0x04])
         certificate_size = self.unpack_dword(pe_data[certificate_table_addr+0x04:certificate_table_addr+0x08])
